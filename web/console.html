@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MetricStore Console</title>
+<style>
+body { font-family: "Microsoft YaHei", sans-serif; margin: 24px; color: #222; }
+h1 { font-size: 20px; }
+table { border-collapse: collapse; margin-top: 12px; }
+td, th { border: 1px solid #ccc; padding: 4px 10px; font-size: 13px; }
+.row { margin: 8px 0; }
+input, select { margin-right: 8px; }
+</style>
+</head>
+<body>
+<h1>MetricStore 时序指标存储引擎控制台</h1>
+<div class="row">
+  <label>指标名 <input id="name" value="cpu.usage"></label>
+  <label>标签 <input id="labels" value="host=node-1"></label>
+  <button onclick="query()">查询</button>
+</div>
+<div class="row">
+  <label>开始(ms) <input id="start" value="0"></label>
+  <label>结束(ms) <input id="end" value="0"></label>
+  <label>聚合 <select id="agg"><option>avg</option><option>sum</option><option>min</option><option>max</option><option>count</option><option>delta</option></select></label>
+</div>
+<div class="row" id="stats"></div>
+<table id="table"><thead><tr><th>时间窗</th><th>值</th><th>点数</th></tr></thead><tbody></tbody></table>
+<script>
+async function loadStats() {
+  const r = await fetch("/api/stats");
+  const s = await r.json();
+  document.getElementById("stats").textContent =
+    "shards=" + s.shards + " blocks=" + s.blocks + " series=" + s.series + " buffer=" + s.buffer;
+}
+async function query() {
+  const name = document.getElementById("name").value;
+  const labels = document.getElementById("labels").value;
+  const start = document.getElementById("start").value;
+  const end = document.getElementById("end").value;
+  const agg = document.getElementById("agg").value;
+  const url = "/api/query?name=" + encodeURIComponent(name) +
+    "&labels=" + encodeURIComponent(labels) +
+    "&start=" + start + "&end=" + end + "&agg=" + agg + "&step=60000";
+  const r = await fetch(url);
+  const rows = await r.json();
+  const tbody = document.querySelector("#table tbody");
+  tbody.innerHTML = "";
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + new Date(row.TS / 1000000).toISOString() + "</td><td>" + row.Value + "</td><td>" + row.Count + "</td>";
+    tbody.appendChild(tr);
+  }
+}
+loadStats();
+</script>
+</body>
+</html>
