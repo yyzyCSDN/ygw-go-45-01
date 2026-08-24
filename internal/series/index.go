@@ -72,20 +72,30 @@ func (ix *Index) Len() int {
 	return total
 }
 
-// Expand migrates the index to a larger bucket table. Registration happening
-// concurrently with expansion is routed to whichever table is current at the
-// time the lock is acquired, so no registration is lost.
+// Expand migrates the index to a larger bucket table. Existing entries are
+// rehashed into the new table, so a series registered before the expansion —
+// including one whose Register completed while it held the lock just before
+// Expand acquired it — stays visible by label lookup on the new table.
 func (ix *Index) Expand(newBuckets int) error {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
 	if newBuckets <= len(ix.buckets) {
 		return fmt.Errorf("expand requires more buckets than current %d", len(ix.buckets))
 	}
-	ix.mu.Lock()
-	defer ix.mu.Unlock()
 	next := make([]map[string]*model.SeriesMeta, newBuckets)
 	for i := range next {
 		next[i] = make(map[string]*model.SeriesMeta)
 	}
+	// Swap the table in first so bucket() resolves against the new width, then
+	// rehash every existing entry into its new bucket. Done under the write
+	// lock, so concurrent Register/Lookup observe one consistent table.
+	old := ix.buckets
 	ix.buckets = next
+	for _, b := range old {
+		for key, meta := range b {
+			ix.buckets[ix.bucket(key)][key] = meta
+		}
+	}
 	return nil
 }
 
