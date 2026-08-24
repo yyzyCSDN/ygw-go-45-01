@@ -156,10 +156,16 @@ func (in *Ingest) flushLocked(seq uint64) error {
 	}
 	in.lastFlushSeq = seq
 	in.reg.Counter("blocks_flushed").Inc(int64(len(groups)))
-	if err := in.wal.SetReplayStart(seq + 1); err != nil {
+	// Order matters for crash safety: truncate the WAL records physically first,
+	// and only advance the replay watermark once the truncate succeeded. If we
+	// advanced the watermark before truncating (or before the block is durable)
+	// and crashed in between, recovery would replay from the new watermark and
+	// silently skip this batch — exactly the ~30s gap we saw. A failed truncate
+	// leaves the watermark untouched so the next replay re-covers this batch.
+	if err := in.wal.TruncateTo(seq); err != nil {
 		return err
 	}
-	return in.wal.TruncateTo(seq)
+	return in.wal.SetReplayStart(seq + 1)
 }
 
 // groupByShard splits a snapshot into one point set per time shard so a block

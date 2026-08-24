@@ -15,21 +15,13 @@ func checksum(payload []byte) uint32 {
 	return crc32.Checksum(payload, crcTable)
 }
 
-// appendChecksum appends the checksum to a record payload.
-func appendChecksum(payload []byte) []byte {
-	out := make([]byte, len(payload)+crcSize)
-	copy(out, payload)
-	binary.LittleEndian.PutUint32(out[len(payload):], checksum(payload))
-	return out
-}
-
-// verifyChecksum reports whether the trailing checksum of a record matches its
-// payload.
-func verifyChecksum(record []byte) bool {
-	if len(record) < recordSize+crcSize {
+// verifyChecksumOf checks a fixed-length frame's payload against its trailing
+// checksum slice. Both slices carry exactly recordSize / crcSize bytes in the
+// framed on-disk layout.
+func verifyChecksumOf(payload, sum []byte) bool {
+	if len(payload) < recordSize || len(sum) < crcSize {
 		return false
 	}
-	payload := record[:recordSize]
-	expected := binary.LittleEndian.Uint32(record[recordSize:])
-	return checksum(payload) == expected
+	expected := binary.LittleEndian.Uint32(sum[:crcSize])
+	return checksum(payload[:recordSize]) == expected
 }

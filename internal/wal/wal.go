@@ -119,25 +119,15 @@ func (w *WAL) openSegment(path string, idx int) (*Segment, error) {
 		return nil, err
 	}
 	seg := &Segment{path: path, file: f, size: info.Size(), first: ^uint64(0)}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) < recordSize+crcSize {
-			continue
+	if err := scanSegment(f, func(rec Record) error {
+		if rec.Seq < seg.first {
+			seg.first = rec.Seq
 		}
-		if !verifyChecksum(line) {
-			continue
+		if rec.Seq > seg.last {
+			seg.last = rec.Seq
 		}
-		seq := binary.LittleEndian.Uint64(line[0:8])
-		if seq < seg.first {
-			seg.first = seq
-		}
-		if seq > seg.last {
-			seg.last = seq
-		}
-	}
-	if err := scanner.Err(); err != nil {
+		return nil
+	}); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -181,8 +171,13 @@ func (w *WAL) Append(rec Record) (uint64, error) {
 		return 0, err
 	}
 	w.nextSeq++
-	w.nextReplay = rec.Seq + 1
-	_ = w.persistReplayLocked()
+	// nextReplay is the first sequence that has NOT yet been flushed to a
+	// storage block and therefore must still be replayable from the WAL. It
+	// is advanced only by the flush path (SetReplayStart) once the data is
+	// durable. Advancing it here — to "just-written seq + 1" — would make
+	// ReplayUnflushed start past the newest record on recovery, silently
+	// skipping the entire unflushed tail (the ~30s gap seen after a power
+	// loss). Do not touch it from the write path.
 	return rec.Seq, nil
 }
 
@@ -203,15 +198,42 @@ func (w *WAL) rotateLocked() error {
 	return w.rotate()
 }
 
+// frameSize is the fixed on-disk size of one record: payload + CRC. Records are
+// framed by length, not by a delimiter byte. A previous version appended '\n'
+// and read with bufio.Scanner (line-oriented) on top of a binary payload — any
+// payload or CRC byte equal to 0x0A prematurely split a record, so the torn
+// remainder failed the length/checksum check and was silently dropped. With
+// seq 10 (TS low byte 0x0A) and several CRC bytes, every replay lost a fixed
+// ~3% of records deterministically. Fixed-length framing removes the
+// dependency on byte values entirely.
+const frameSize = recordSize + crcSize
+
 func encodeRecord(rec Record) []byte {
-	buf := make([]byte, 0, recordSize+crcSize+1)
-	buf = binary.LittleEndian.AppendUint64(buf, rec.Seq)
-	buf = binary.LittleEndian.AppendUint64(buf, rec.SeriesID)
-	buf = binary.LittleEndian.AppendUint64(buf, uint64(rec.TS))
-	buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(rec.Value))
-	buf = appendChecksum(buf)
-	buf = append(buf, '\n')
+	buf := make([]byte, frameSize)
+	binary.LittleEndian.PutUint64(buf[0:8], rec.Seq)
+	binary.LittleEndian.PutUint64(buf[8:16], rec.SeriesID)
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(rec.TS))
+	binary.LittleEndian.PutUint64(buf[24:32], math.Float64bits(rec.Value))
+	binary.LittleEndian.PutUint32(buf[recordSize:], checksum(buf[:recordSize]))
 	return buf
+}
+
+// decodeFrame parses one fixed-length frame. ok is false for a torn or
+// checksum-mismatched frame; the caller treats the segment as ended there.
+func decodeFrame(buf []byte) (Record, bool) {
+	if len(buf) < frameSize {
+		return Record{}, false
+	}
+	payload := buf[:recordSize]
+	if !verifyChecksumOf(payload, buf[recordSize:recordSize+crcSize]) {
+		return Record{}, false
+	}
+	return Record{
+		Seq:      binary.LittleEndian.Uint64(payload[0:8]),
+		SeriesID: binary.LittleEndian.Uint64(payload[8:16]),
+		TS:       int64(binary.LittleEndian.Uint64(payload[16:24])),
+		Value:    math.Float64frombits(binary.LittleEndian.Uint64(payload[24:32])),
+	}, true
 }
 
 func (s *Segment) write(rec Record) error {
@@ -296,31 +318,39 @@ func (w *WAL) Replay(from uint64, fn func(Record) error) error {
 	return nil
 }
 
-func scanRecords(r io.Reader, from uint64, fn func(Record) error) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) < recordSize+crcSize {
-			continue
+// scanSegment reads fixed-length frames from r, invoking fn for each valid
+// record. Reading stops at the first torn or checksum-mismatched frame — that
+// marks the end of the durable prefix (a crash mid-write leaves a partial
+// frame). Any trailing bytes shorter than one frame are ignored the same way.
+func scanSegment(r io.Reader, fn func(Record) error) error {
+	buf := make([]byte, frameSize)
+	for {
+		_, err := io.ReadFull(r, buf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// A short final read is a torn write from a crash; stop here.
+			return nil
 		}
-		if !verifyChecksum(line) {
-			continue
+		if err != nil {
+			return err
 		}
-		rec := Record{
-			Seq:      binary.LittleEndian.Uint64(line[0:8]),
-			SeriesID: binary.LittleEndian.Uint64(line[8:16]),
-			TS:       int64(binary.LittleEndian.Uint64(line[16:24])),
-			Value:    math.Float64frombits(binary.LittleEndian.Uint64(line[24:32])),
-		}
-		if rec.Seq < from {
-			continue
+		rec, ok := decodeFrame(buf)
+		if !ok {
+			// Corrupt frame: treat the rest of the segment as unwritten.
+			return nil
 		}
 		if err := fn(rec); err != nil {
 			return err
 		}
 	}
-	return scanner.Err()
+}
+
+func scanRecords(r io.Reader, from uint64, fn func(Record) error) error {
+	return scanSegment(r, func(rec Record) error {
+		if rec.Seq < from {
+			return nil
+		}
+		return fn(rec)
+	})
 }
 
 // NextSeq returns the next sequence number that will be assigned.
