@@ -96,7 +96,11 @@ func aggregateWindow(pts []model.Point, step int64) []model.Point {
 		count int
 	}
 	var windows []acc
-	for i := 0; i < len(pts)-1; i++ {
+	// Iterate every point, including the last. The previous bound
+	// `len(pts)-1` dropped the final sample of each series, which lost the
+	// trailing window point and made downstream per-point reconciliation come
+	// up one short at the window edge.
+	for i := 0; i < len(pts); i++ {
 		p := pts[i]
 		start := p.TS - p.TS%step
 		if len(windows) == 0 || windows[len(windows)-1].ts != start {
