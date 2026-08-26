@@ -1,0 +1,9 @@
+data
+*.log
+.git
+evidence
+workspaces
+cases
+private_oracles
+staging
+runner
